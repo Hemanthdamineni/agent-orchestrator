@@ -342,8 +342,9 @@ export function ChatComposer({
 			.then((value) => {
 				if (!mounted) return;
 				const draft = decodeResponseDraft(value);
+				// Text typed before the read finished wins, and so does its caret.
+				if (!latestText.current) setCursor(undefined);
 				setText((current) => current || draft.text);
-				setCursor(undefined);
 				setQuotes((current) => [...draft.quotes.filter((quote) => !current.some((item) => item.id === quote.id)), ...current]);
 			})
 			.catch(() => {})
