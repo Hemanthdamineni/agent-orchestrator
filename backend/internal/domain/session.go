@@ -134,6 +134,9 @@ type SessionArtifactFile struct {
 	Size      int64               `json:"size"`
 	UpdatedAt time.Time           `json:"updatedAt"`
 	ShareURL  string              `json:"shareUrl,omitempty"`
+	// ShareAccess is who ShareURL opens for, as the desktop last recorded it:
+	// restricted (invited people only) or anyone. Empty when not recorded.
+	ShareAccess string `json:"shareAccess,omitempty"`
 	// Registered is set on a file the agent registered as a deliverable, or
 	// inside a bundle directory it registered.
 	Registered bool `json:"registered,omitempty"`
@@ -552,6 +555,7 @@ type SessionWait struct {
 
 // SessionBranchState is the session branch's commit and push facts.
 type SessionBranchState struct {
+	Branch string `json:"branch,omitempty"`
 	// Commits is how many commits the branch has on top of its base.
 	Commits int `json:"commits"`
 	// RemoteBranch is the remote-tracking branch, such as "origin/feat/x".

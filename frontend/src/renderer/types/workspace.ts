@@ -91,6 +91,10 @@ export type SessionArtifact = {
 	previousPaths?: string[];
 	/** The file's public link while it is published from this computer. */
 	shareUrl?: string;
+	/** A cloud file's SHA-256, from its listing: the Publish button compares it with the published one. */
+	sha256?: string;
+	/** Who shareUrl opens for, as this computer last recorded it; the link list has the final say. */
+	shareAccess?: "restricted" | "anyone";
 };
 
 /** The daemon-committed controller currently responsible for the session. */
@@ -148,6 +152,7 @@ export type WorkspaceSession = {
 	reviewerConfig?: {
 		model?: string;
 		mode?: string;
+		effort?: string;
 		permissions?: string;
 	};
 	/** Whether the daemon may automatically review this session after it becomes idle. */
@@ -471,6 +476,16 @@ export function sessionWorkspaceReady(session: Pick<WorkspaceSession, "workspace
 
 export function sessionIsActive(session: WorkspaceSession): boolean {
 	return session.isTerminated !== true && session.status !== "terminated";
+}
+
+/**
+ * Whether a live worker can be archived from its own tab, topbar shortcut, or
+ * inspector: local, remote, or Cloud alike. The orchestrator goes with its
+ * project, and a Cloud session shared from another organization is the
+ * sharer's to archive.
+ */
+export function canArchiveWorkerSession(session: WorkspaceSession): boolean {
+	return !isOrchestratorSession(session) && session.cloud?.shared !== true && sessionIsActive(session);
 }
 
 /**

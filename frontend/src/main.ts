@@ -1,5 +1,9 @@
-import { SideCloseRecovery } from "./main/side-close";
+import type { SideCloseRequest, SideCloseState } from "./shared/side-close";
+import { SideCloseRecovery, type SideSnapshotCoverage } from "./main/side-close";
+import { SideCloseController } from "./main/side-close-controller";
 import { SideLaunchRecovery } from "./main/side-launch-recovery";
+import { launchTriageInTerminal } from "./main/triage-launch";
+import { initializeDesktopLog } from "./main/desktop-log";
 import { syncMacWindowButtons } from "./main/window-chrome";
 import { MAC_TRAFFIC_LIGHT_ROW_HEIGHT, MAC_WINDOW_BUTTON_X, MAC_WINDOW_BUTTON_RADIUS } from "./shared/window-chrome";
 import { finishUpdateQuit } from "./main/update-quit";
@@ -62,6 +66,7 @@ import { createCliShadowShellPath } from "./main/cli-shadow-shell-path";
 import { cliShadowEnabled } from "./shared/cli-shadow";
 import { registerDictationIpc } from "./main/dictation";
 import { launchCommand } from "./main/launch-command";
+import { createLaunchTiming } from "./main/launch-timing";
 import { readNativeAppIcon } from "./main/native-app-icon";
 import { blocksRenderFrameNavigation, cloudArtifactPrefix } from "./main/render-frame-guard";
 import { agentPageRequestAllowed } from "./main/render-frame-network";
@@ -96,6 +101,8 @@ import {
 } from "./shared/daemon-startup-status";
 import { reloadAppView, toggleAppDevTools } from "./main/app-devtools";
 import { acceptLanguages, applyBrowserIdentity, applyUserAgentFallback } from "./main/browser-identity";
+import { purgeRootCachesOnce, sweepTemporaryBrowserPartitions } from "./main/browser-storage-cleanup";
+import { createUserBrowser } from "./main/user-browser";
 import { openChromeExtensionsPage } from "./main/chrome-extensions-page";
 import { appShortcutDelivery, attachAppShortcuts, attachShellReloadGuard } from "./main/app-shortcuts";
 import { relayScrollPhases } from "./main/scroll-phase";
@@ -118,6 +125,7 @@ import {
 	type AppShortcutId,
 	type KeybindingOverrides,
 } from "./shared/shortcuts";
+import { OPEN_SESSION_DEEP_LINK_CHANNEL, normalizeSessionDeepLink } from "./shared/deep-links";
 import { createTrayController, type TrayController } from "./main/tray";
 import { createTrayLifecycle, isTrayEnabled } from "./main/tray-lifecycle";
 import { createDesktopQuitController } from "./main/desktop-quit";
@@ -352,7 +360,9 @@ app.setPath(
 // Resolve once against the launch cwd, before the daemon can chdir. The exact
 // absolute value is shared by policy bootstrap and every daemon spawn.
 const desktopLaunchWorkingDirectory = process.cwd();
+const launchTiming = createLaunchTiming(process.getCreationTime() ?? performance.timeOrigin);
 const desktopDataDir = resolveDesktopDataDir(process.env, os.homedir(), desktopLaunchWorkingDirectory, app.isPackaged);
+initializeDesktopLog(desktopDataDir);
 let telemetryPolicyController: DesktopTelemetryController | null = null;
 // PostHog identity: the user-facing analytics opt-out (marker file shared with the
 // daemon) and the loopback hand-off of the signed-in AO Cloud user ID.
@@ -418,6 +428,13 @@ const OPEN_FOLDER_PATH_CHANNEL = "app:openFolderPath";
 // whose renderer isn't mounted yet. Flushed once the shell signals readiness
 // via TRAY_RENDERER_READY_CHANNEL — see the OPEN_FOLDER_PATH_CHANNEL handler.
 let pendingFolderPath: string | null = null;
+// Session deep link (ao-app://sessions/…) that arrived before the shell was
+// mounted (cold-start argv or early open-url). Flushed on the same
+// TRAY_RENDERER_READY_CHANNEL handshake as pendingFolderPath.
+let pendingSessionDeepLink: string | null = null;
+// Billing return (ao-app://billing) that arrived with no shell to take it —
+// flushed on the TRAY_RENDERER_READY handshake like pendingSessionDeepLink.
+let pendingBillingSection: string | null = null;
 let daemonProcess: ChildProcess | null = null;
 // Set once this instance owns the single-instance lock; a no-op before that.
 let lifecycleLog: LifecycleRecord = () => undefined;
@@ -810,29 +827,43 @@ let sideLaunchState: { appRunId: string; sides: unknown[]; numbers?: Record<stri
 const SIDE_STATE_BACKSTOP_MS = 5_000;
 let sideStateTimer: ReturnType<typeof setInterval> | undefined;
 const sideCloseRecovery = new SideCloseRecovery();
-function publishPendingSideCloses(): void {
-	getShellWebContents()?.send("sideChats:pendingClosesChanged");
-}
-function rememberSideLaunchState(state: { appRunId: string; sides: unknown[]; numbers?: Record<string, number> }): void {
-	sideCloseRecovery.remember(state);
+const sideCloseController = new SideCloseController({
+	ledger: sideCloseRecovery,
+	attachment: () => sideLaunchRecovery.attachment,
+	ensureClaimed: () => sideLaunchRecovery.ensureClaimed(),
+	capture: () => sideLaunchRecovery.captureForClose(),
+	onOwnershipChange: () => { sideLaunchState = sideCloseRecovery.state; },
+	onChange: (state: SideCloseState) => { getShellWebContents()?.send("sideChats:closeStateChanged", state); },
+});
+function rememberSideLaunchState(state: { appRunId: string; sides: unknown[]; numbers?: Record<string, number> }, coverage: SideSnapshotCoverage): void {
+	sideCloseRecovery.remember(state, coverage);
 	sideLaunchState = sideCloseRecovery.state;
-	publishPendingSideCloses();
+	sideCloseController.reconcile(coverage);
+}
+
+function armSideStateBackstop(): void {
+	if (sideStateTimer) return;
+	sideStateTimer = setInterval(() => {
+		if (sideLaunchRecovery.status === "ready" || sideCloseController.hasPending()) sideLaunchRecovery.captureCloseInBackground();
+	}, SIDE_STATE_BACKSTOP_MS);
 }
 
 const sideLaunchRecovery = new SideLaunchRecovery({
 	snapshot: () => sideLaunchState,
-	onRestore: () => sideCloseRecovery.markRestoreAttempt(),
+	onRestore: (snapshot) => sideCloseRecovery.markRestoreAttempt(snapshot),
+	onRestoreAccepted: (snapshot) => { sideCloseRecovery.markRestoreAccepted(snapshot); sideLaunchState = sideCloseRecovery.state; sideCloseController.reconcile(); },
 	onSnapshot: rememberSideLaunchState,
 	onError: error => console.warn("AO: side chat recovery or capture failed", error),
+	onClaimed: () => { sideCloseController.setRecovery("restoring"); armSideStateBackstop(); },
 	onReady: () => {
-		const capture = () => sideLaunchRecovery.captureInBackground();
-		capture();
-		if (sideStateTimer) clearInterval(sideStateTimer);
-		sideStateTimer = setInterval(capture, SIDE_STATE_BACKSTOP_MS);
+		sideCloseController.setRecovery("ready"); // gated until a post-ready capture is applied
+		sideLaunchRecovery.captureCloseInBackground();
+		armSideStateBackstop();
 	},
 });
 app.once("will-quit", () => {
 	sideLaunchRecovery.setAttachment(undefined);
+	sideCloseController.setAttachment(undefined, "unavailable");
 	if (sideStateTimer) clearInterval(sideStateTimer);
 	sideStateTimer = undefined;
 });
@@ -847,6 +878,7 @@ function setDaemonStatus(nextStatus: DaemonStatus): void {
 		disposeBrowserStreamLink();
 	}
 	daemonStatus = nextStatus;
+	if (nextStatus.state === "ready") launchTiming.mark("daemonReady");
 	if (nextStatus.state === "ready") void telemetryIdentity.flush();
 	else telemetryIdentity.invalidate();
 	getShellWebContents()?.send("daemon:status", daemonStatus);
@@ -861,6 +893,8 @@ function setDaemonStatus(nextStatus: DaemonStatus): void {
 		if (sideStateTimer) clearInterval(sideStateTimer);
 		sideStateTimer = undefined;
 	}
+	// The daemon status/URL event above precedes the new close epoch/projection.
+	sideCloseController.setAttachment(sideLaunchRecovery.attachment, sideLaunchRecovery.status);
 }
 
 const MAX_DAEMON_OUTPUT_CHARS = 12_000;
@@ -974,9 +1008,17 @@ function browserProfileStateDir(): string {
 	return path.dirname(runFile ?? path.join(os.homedir(), ".ao", "running.json"));
 }
 
+// The person's own browser, for pages that refuse AO's Browser panel.
+const userBrowser = createUserBrowser({
+	platform: process.platform,
+	openExternal: (url) => shell.openExternal(url),
+	defaultBrowserName: () => app.getApplicationNameForProtocol("https://"),
+});
+
 async function clearElectronBrowserProfileData(partition: string): Promise<void> {
 	const browserSession = session.fromPartition(partition);
-	await Promise.all([browserSession.clearStorageData(), browserSession.clearCache()]);
+	// clearCache leaves V8's code cache, which is most of what a cleared partition still holds.
+	await Promise.all([browserSession.clearStorageData(), browserSession.clearCache(), browserSession.clearCodeCaches({})]);
 }
 
 async function disposeAllBrowserViewHosts(): Promise<void> {
@@ -1265,6 +1307,8 @@ async function createWindowInternal(): Promise<void> {
 			notify: (state) => { awakeDownloads.update(state); shellWebContents.send("browser:downloadsChanged", state); },
 		}),
 		clearBrowserProfileData: clearElectronBrowserProfileData,
+		openInUserBrowser: (url) => userBrowser.open(url),
+		describeUserBrowser: () => userBrowser.describe(),
 		prepareBrowserPartition: (partition) =>
 			applyBrowserIdentity(session.fromPartition(partition), {
 				chromeVersion: process.versions.chrome,
@@ -1312,6 +1356,7 @@ async function createWindowInternal(): Promise<void> {
 		establishBrowserStreamLink();
 	}
 
+	mainWindow.once("show", () => launchTiming.mark("windowShown"));
 	showWhenRendererLoaded(mainWindow, shellWebContents);
 	void shellWebContents.loadURL(rendererUrl());
 
@@ -3147,54 +3192,30 @@ ipcMain.handle("daemon:restart", async () => {
 		return reportDaemonRestartFailure(error);
 	}
 });
-async function captureSideChatState(closedSideId?: string, cancelClose = false, alreadyClosedId?: string): Promise<void> {
-	// Pin known ownership immediately, even while an older restore is in flight.
-	// A second daemon crash must not lose this close intent while capture waits.
-	if (closedSideId && !cancelClose && sideLaunchState?.sides.some((record) => (record as { side?: { id?: string } }).side?.id === closedSideId)) {
-		sideCloseRecovery.begin(closedSideId);
-		sideLaunchState = sideCloseRecovery.state;
-		publishPendingSideCloses();
-	}
-	await sideLaunchRecovery.ensureReady();
-	if (closedSideId) {
-		if (cancelClose) sideCloseRecovery.cancel(closedSideId);
-		else {
-			// Capture missing ownership before allowing DELETE. Once pinned, later
-			// snapshot failures must retain the cleanup record.
-			if (!sideLaunchState?.sides.some((record) => (record as { side?: { id?: string } }).side?.id === closedSideId)) await captureSideChatState();
-			sideCloseRecovery.begin(closedSideId);
-		}
-		sideLaunchState = sideCloseRecovery.state;
-		publishPendingSideCloses();
-	}
-	const { attachment, state } = await sideLaunchRecovery.capture();
-	if (!sideLaunchRecovery.matches(attachment)) throw new Error("Side chat daemon attachment changed. Retry after reconnecting.");
-	if (alreadyClosedId) {
-		sideCloseRecovery.reconcileMissing(alreadyClosedId, state);
-		sideLaunchState = sideCloseRecovery.state;
-		publishPendingSideCloses();
-	}
+async function captureSideChatState(): Promise<void> {
+	const generation = daemonAttachmentGeneration;
+	// A verified OPEN side can accept a draft/receipt while an unrelated
+	// restore is rejected. Its capture must share the coverage-aware queue
+	// with close operations rather than wait for full-launch readiness.
+	const { attachment } = await sideLaunchRecovery.captureForClose();
+	if (generation !== daemonAttachmentGeneration || !sideLaunchRecovery.matches(attachment)) throw new Error("Side chat daemon attachment changed. Retry after reconnecting.");
 }
 
-ipcMain.handle("sideChats:capture", async (event, closedSideId?: string, cancelClose = false) => {
+ipcMain.handle("sideChats:capture", async (event, ...legacyCloseArguments: unknown[]) => {
 	if (event.sender !== getShellWebContents()) throw new Error("Untrusted side chat capture request.");
-	if (closedSideId !== undefined && (typeof closedSideId !== "string" || closedSideId.length > 255)) {
-		throw new Error("Invalid side chat identity.");
-	}
-	if (typeof cancelClose !== "boolean") throw new Error("Invalid close cancellation.");
-	return captureSideChatState(closedSideId, cancelClose);
+	if (legacyCloseArguments.length) throw new Error("Side chat close protocol changed. Reload the desktop app.");
+	return captureSideChatState();
 });
-ipcMain.handle("sideChats:confirmClose", async (event, sideId: string, alreadyClosed = false) => {
-	if (event.sender !== getShellWebContents() || typeof sideId !== "string" || !sideId || sideId.length > 255 || typeof alreadyClosed !== "boolean") throw new Error("Invalid side close confirmation.");
-	if (alreadyClosed) { await captureSideChatState(undefined, false, sideId); return; }
-	sideCloseRecovery.confirm(sideId);
-	publishPendingSideCloses();
-	// DELETE already established success. Keep cleanup in RAM while refreshing.
-	sideLaunchRecovery.captureInBackground();
+ipcMain.handle("sideChats:confirmClose", () => {
+	throw new Error("Side chat close protocol changed. Reload the desktop app.");
 });
-ipcMain.handle("sideChats:pendingCloses", (event, sessionId: string) => {
-	if (event.sender !== getShellWebContents() || typeof sessionId !== "string" || sessionId.length > 255) throw new Error("Invalid side close query.");
-	return sideCloseRecovery.pending(sessionId);
+ipcMain.handle("sideChats:requestClose", (event, input: SideCloseRequest) => {
+	if (event.sender !== getShellWebContents()) throw new Error("Untrusted side chat close request.");
+	return sideCloseController.requestClose(input);
+});
+ipcMain.handle("sideChats:closeState", (event, sessionId: string) => {
+	if (event.sender !== getShellWebContents() || typeof sessionId !== "string" || !sessionId || sessionId.length > 255) throw new Error("Invalid side close query.");
+	return sideCloseController.summary(sessionId);
 });
 
 ipcMain.handle("editorHandoff:pathAction", (event, input) => {
@@ -3231,6 +3252,20 @@ ipcMain.handle("editorHandoff:copyWorkspacePath", (event, sessionId: string) => 
 	return editorHandoff.copyWorkspacePath(typeof sessionId === "string" ? sessionId : "");
 });
 ipcMain.handle("app:getVersion", () => app.getVersion());
+async function triageEnv(): Promise<NodeJS.ProcessEnv> {
+	await ensureShellEnv();
+	const env = process.platform === "win32"
+		? { ...process.env, ...(cachedShellEnv ?? {}) }
+		: buildDaemonEnv(process.env, cachedShellEnv, {}, configuredLoginShell);
+	return {
+		...env,
+		AO_DEV_DAEMON_BINARY: daemonLaunchEnv().AO_DEV_DAEMON_BINARY,
+		AO_DATA_DIR: path.resolve(desktopDataDir),
+		AO_RUN_FILE: path.resolve(runFilePath() ?? path.join(desktopDataDir, "running.json")),
+	};
+}
+ipcMain.handle("triage.launch", async () => launchTriageInTerminal(await triageEnv()));
+
 const dictation = registerDictationIpc(
 	path.join(
 		app.isPackaged ? process.resourcesPath : app.getAppPath(),
@@ -4110,6 +4145,16 @@ ipcMain.handle(
 
 // The renderer could not decode or start the bundled sound. Beep so the
 // notification still makes a sound where the OS beep works at all.
+// The shell reports the first frame that shows the workspace, which ends the
+// launch. Logged once: a reload reports the frame again.
+let launchTimingLogged = false;
+ipcMain.on("app:sessionsShown", (event) => {
+	if (event.sender !== getShellWebContents() || launchTimingLogged) return;
+	launchTimingLogged = true;
+	launchTiming.mark("sessionsShown");
+	console.info(launchTiming.line());
+});
+
 ipcMain.on("notifications:soundFailed", (event) => {
 	if (event.sender !== getShellWebContents()) return;
 	shell.beep();
@@ -4186,6 +4231,16 @@ ipcMain.on(TRAY_RENDERER_READY_CHANNEL, (event) => {
 	if (pendingFolderPath && event.sender === getShellWebContents()) {
 		event.sender.send(OPEN_FOLDER_PATH_CHANNEL, pendingFolderPath);
 		pendingFolderPath = null;
+	}
+
+	if (pendingSessionDeepLink && event.sender === getShellWebContents()) {
+		event.sender.send(OPEN_SESSION_DEEP_LINK_CHANNEL, pendingSessionDeepLink);
+		pendingSessionDeepLink = null;
+	}
+
+	if (pendingBillingSection && event.sender === getShellWebContents()) {
+		event.sender.send(OPEN_SETTINGS_SHORTCUT_CHANNEL, pendingBillingSection);
+		pendingBillingSection = null;
 	}
 });
 
@@ -4323,6 +4378,14 @@ function isShareDeepLink(raw: string): boolean {
 }
 
 async function handleCloudDeepLinkAndFocus(url: string): Promise<void> {
+	// macOS keeps the app (and tray) alive after the close button —
+	// window-all-closed does not quit — and a link clicked then fires open-url
+	// without activate, so nothing else recreates the shell. Hidden utility
+	// windows can linger, so the window list is not the test: recreate when
+	// there is no shell to deliver to. The queued links below flush once its
+	// fresh shell mounts. Windows/Linux quit on the last window closing, so
+	// this never fires there.
+	if (!getShellWebContents()) void createWindow();
 	focusCloudWindow();
 	// A shared cloud session: the renderer redeems it and opens the session.
 	if (isShareDeepLink(url)) {
@@ -4333,9 +4396,38 @@ async function handleCloudDeepLinkAndFocus(url: string): Promise<void> {
 	}
 	// Stripe Checkout and the Customer Portal return here (via the control
 	// plane's /billing/return page): open Settings on Billing, which re-reads
-	// the plan when it mounts.
+	// the plan when it mounts. Queue while the shell is missing or still
+	// loading — flushed on renderer ready like the other pending links.
 	if (isBillingDeepLink(url)) {
-		getShellWebContents()?.send(OPEN_SETTINGS_SHORTCUT_CHANNEL, "billing");
+		const contents = getShellWebContents();
+		if (contents && !contents.isDestroyed() && !contents.isLoading()) {
+			contents.send(OPEN_SETTINGS_SHORTCUT_CHANNEL, "billing");
+		} else {
+			pendingBillingSection = "billing";
+		}
+		return;
+	}
+	// ao-app://sessions/… from external tools: forward the canonical URL to the
+	// shell, which re-reads it as its in-app ao:// form and resolves it against
+	// its workspace lists with the same session-links path as ao:// links
+	// (navigate, toast when the session is gone). The canonical form lowercases
+	// the scheme and strips query/hash/trailing slashes the ao:// parser would
+	// reject. Queue it while the renderer is still mounting (cold start) —
+	// flushed on renderer ready, same handshake as pendingFolderPath below.
+	const normalized = normalizeSessionDeepLink(url);
+	if (normalized) {
+		const contents = getShellWebContents()?.isDestroyed() ? null : getShellWebContents();
+		// The newest link wins: one queued for the readiness handshake is stale
+		// once a newer link arrives, so clear it here either way. Dropping it on
+		// the direct-send path keeps the handshake from navigating the stale
+		// link after this one; replacing it on the queue path keeps the newest
+		// click last.
+		pendingSessionDeepLink = null;
+		if (contents && !contents.isLoading()) {
+			contents.send(OPEN_SESSION_DEEP_LINK_CHANNEL, normalized);
+		} else {
+			pendingSessionDeepLink = normalized;
+		}
 		return;
 	}
 	try {
@@ -4471,6 +4563,14 @@ async function writeAppStateOnLaunch(): Promise<void> {
 
 app.whenReady().then(async () => {
 	applyUserAgentFallback(app);
+	launchTiming.mark("appReady");
+	// Before any browser partition exists; both run in the background.
+	void sweepTemporaryBrowserPartitions(app.getPath("userData")).then(({ removed, failed }) => {
+		if (removed || failed) console.info(`browser storage: removed ${removed} leftover temporary profiles${failed ? `, ${failed} failed` : ""}`);
+	});
+	void purgeRootCachesOnce(session.defaultSession, app.getPath("userData")).catch((error: unknown) => {
+		console.warn("browser storage: root cache purge failed; retrying next launch:", error);
+	});
 	powerMonitor.on("suspend", () => recordUpdateDiagnostic("power-suspend"));
 	powerMonitor.on("resume", () => recordUpdateDiagnostic("power-resume"));
 	void refreshGitHubOwners();

@@ -61,6 +61,17 @@ type ChatLauncher interface {
 	DrainChatQueue(ctx context.Context, id domain.SessionID) error
 }
 
+type chatEnvironmentPreflighter interface {
+	PreflightChatWithEnv(context.Context, domain.AgentHarness, ports.PermissionMode, map[string]string) error
+}
+
+func (m *Manager) preflightChat(ctx context.Context, harness domain.AgentHarness, permissions ports.PermissionMode, env map[string]string) error {
+	if preflighter, ok := m.chat.(chatEnvironmentPreflighter); ok {
+		return preflighter.PreflightChatWithEnv(ctx, harness, permissions, env)
+	}
+	return m.chat.PreflightChat(ctx, harness, permissions)
+}
+
 type chatBackgroundTaskRunner interface {
 	RunBackgroundTask(context.Context, domain.AgentHarness, ports.ChatStartConfig, string) (string, error)
 }
@@ -168,9 +179,9 @@ func (m *Manager) runRecordBackgroundTask(ctx context.Context, rec domain.Sessio
 }
 
 func backgroundTaskPermissions(harness domain.AgentHarness) ports.PermissionMode {
-	// Kimi ACP exposes only its default mode; every other driver gets AO's
-	// workspace sandbox so title generation cannot inherit a bypass policy.
-	if harness == domain.HarnessKimi {
+	// Kimi and Grok ACP do not support accept-edits. Background tasks require
+	// disabled tools; each binding must enforce that restriction or reject it.
+	if harness == domain.HarnessKimi || harness == domain.HarnessGrok {
 		return ports.PermissionModeDefault
 	}
 	return ports.PermissionModeAcceptEdits
@@ -250,12 +261,33 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		}
 	}
 
+	providerConversationID, forkHandoffNote := "", ""
+	if fork := in.cfg.Fork; fork != nil && fork.Handoff != nil && fork.PrepareChat == nil {
+		// The agent can't copy its own conversation: the fork's fresh agent
+		// starts with AO's copy, as text.
+		forkHandoffNote, err = fork.Handoff(ctx, ports.ForkTarget{SessionID: id, DataDir: m.dataDir, WorkspacePath: in.workspace.Path, Env: env})
+		if err != nil {
+			m.rollbackSeedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, false, in.promptQueued)
+			return domain.SessionRecord{}, wrapSpawnStage(id, ErrChatController, fmt.Errorf("fork: copy conversation: %w", err))
+		}
+	}
+	if fork := in.cfg.Fork; fork != nil && fork.PrepareChat != nil {
+		providerConversationID, err = fork.PrepareChat(ctx, ports.ForkTarget{
+			SessionID: id, DataDir: m.dataDir, WorkspacePath: in.workspace.Path, Env: env,
+		})
+		if err != nil {
+			m.rollbackSeedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, false, in.promptQueued)
+			return domain.SessionRecord{}, wrapSpawnStage(id, ErrChatController, fmt.Errorf("fork conversation: %w", err))
+		}
+	}
+
 	var (
 		controllerCommitted bool
 		completionErr       error
 	)
 	_, err = m.chat.StartChat(ctx, ChatStart{
 		SessionID:               id,
+		ProviderConversationID:  providerConversationID,
 		ProjectID:               in.cfg.ProjectID,
 		Kind:                    in.cfg.Kind,
 		Harness:                 in.cfg.Harness,
@@ -266,6 +298,8 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		Effort:                  agentConfig.Effort,
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            in.systemPrompt,
+		ForkHandoffNote:         forkHandoffNote,
+		ForkFirstStart:          in.cfg.Fork != nil && in.cfg.Fork.PrepareChat != nil,
 		AdditionalDirectories:   workspaceProjectDirectories(in.workspace.Path, in.workspaceProject),
 		MCPServers:              m.aoMCPServers(ctx, in.cfg.Harness, env),
 		ExpectedControllerOwner: in.record.ControllerOwner(),
@@ -333,8 +367,17 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		}
 		// No controller exists, so nothing provider-side needs closing. The
 		// runtime was never touched, hence runtimeDestroyed=false.
+		if providerConversationID != "" {
+			m.discardForkConversation(ctx, in.cfg.Harness, providerConversationID, in.workspace.Path, env)
+		}
 		m.rollbackSeedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, false, in.promptQueued)
 		return domain.SessionRecord{}, wrapSpawnStage(id, ErrChatController, agentlaunch.RedactError(err, in.project.Config.Env))
+	}
+
+	if fork := in.cfg.Fork; fork != nil && providerConversationID != "" {
+		// The history was imported from the agent's copy, so its artifact
+		// links still name the original.
+		m.pointForkLinksAtFork(ctx, in.cfg.ProjectID, fork.SourceSessionID, id)
 	}
 
 	// The initial prompt is a normal turn through the controller. There is no

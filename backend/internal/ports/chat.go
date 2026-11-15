@@ -430,6 +430,7 @@ type ChatExcerptReference struct {
 	MessageID      string                      `json:"messageId"`
 	Revision       int64                       `json:"revision"`
 	Text           string                      `json:"text"`
+	Comment        string                      `json:"comment,omitempty"`
 }
 
 // ChatExcerptContext carries a frozen selection. Captured context lives in
@@ -795,6 +796,14 @@ type (
 	// copies current context; the caller must keep the source quiescent.
 	ChatIsolatedForker interface {
 		ForkIntoHost(ctx context.Context, sourceProviderConversationID, lastProviderTurnID string, cfg ChatStartConfig) (ChatConversation, error)
+	}
+	// ChatWorkspaceForker copies a provider conversation into a new one that
+	// opens from another workspace, without starting a provider host. Session
+	// forks use it for agents whose native sessions are keyed by folder. A
+	// non-empty upToMessageID is the provider's id for the last message to
+	// keep; empty copies the whole conversation.
+	ChatWorkspaceForker interface {
+		ForkIntoWorkspace(ctx context.Context, sourceProviderConversationID, sourceWorkspace, upToMessageID string, cfg ChatStartConfig) (providerConversationID string, err error)
 	}
 	// ChatNativeTurnID resolves a completed provider turn to its native turn ID.
 	ChatNativeTurnID interface {
@@ -1207,6 +1216,14 @@ type ChatDriver interface {
 	// Resume reattaches to an existing one. It returns ErrChatResumeFailed
 	// rather than silently starting a new conversation.
 	Resume(ctx context.Context, cfg ChatResumeConfig) (ChatConversation, error)
+}
+
+// ChatEnvironmentValidator checks provider prerequisites against the environment
+// overrides that a new session will inherit over the daemon environment. It must
+// not mutate the environment, create files, or launch a provider. These checks
+// are per request and must not be cached with global Chat capabilities.
+type ChatEnvironmentValidator interface {
+	ValidateEnvironment(ctx context.Context, env map[string]string) error
 }
 
 // ChatDriverReconnector attaches only to a surviving provider. Implementations
