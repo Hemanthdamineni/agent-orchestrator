@@ -7448,7 +7448,10 @@ export interface components {
         ListSessionsResponse: {
             archived?: components["schemas"]["SessionArchiveSummary"];
             nextCursor?: string;
+            /** @enum {string} */
+            prState?: "open" | "draft" | "merged" | "closed";
             sessions: components["schemas"]["ControllersSessionView"][];
+            total?: null | number;
         };
         ListShellTerminalsResponse: {
             shellTerminals: components["schemas"]["ShellTerminalResponse"][];
@@ -18996,6 +18999,8 @@ export interface operations {
                 limit?: number;
                 /** @description Opaque cursor returned by the previous page. Requires limit. */
                 cursor?: string;
+                /** @description Keep sessions owning a pull request in this state. The list is then ordered by when each session's newest such PR reached the state, and the response echoes prState and carries total. */
+                prState?: "open" | "draft" | "merged" | "closed";
             };
             header?: never;
             path?: never;
